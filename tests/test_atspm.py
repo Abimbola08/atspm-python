@@ -867,6 +867,151 @@ def test_phase_wait_preempt_overlap():
     )
 
 
+def test_phase_wait_tsp_relaxed_threshold():
+    """
+    Test that a phase wait overlapping a TSP adjustment is judged against
+    tsp_skip_multiplier instead of skip_multiplier.
+
+    TSP pushes service later in the cycle without skipping the phase, so at a
+    signal calling TSP every cycle the ordinary multiplier reports skips for
+    phases that were in fact served. Unlike a preempt the wait is kept - only the
+    threshold moves.
+
+    Cycle length falls back to assumed_cycle_length (100s), so the ordinary
+    threshold is 150s and the TSP threshold is 200s.
+    """
+    from datetime import datetime, timedelta
+
+    base = datetime(2024, 6, 1, 8, 0, 0)
+
+    raw_events = [
+        # Phase 1: 180s wait WITH a TSP adjustment inside it.
+        # Over 150s but under 200s, so the relaxed threshold must clear it.
+        (base, 1001, 43, 1),                                    # Phase call at 0s
+        (base + timedelta(seconds=60), 1001, 113, 1),           # TSP early green at 60s
+        (base + timedelta(seconds=90), 1001, 115, 1),           # TSP checkout at 90s
+        (base + timedelta(seconds=180), 1001, 1, 1),            # Green at 180s
+        (base + timedelta(seconds=190), 1001, 7, 1),            # Green end
+        (base + timedelta(seconds=190.2), 1001, 44, 1),         # Call drop
+
+        # Phase 2: same 180s wait, no TSP. Control - must still count as a skip.
+        (base + timedelta(seconds=600), 1001, 43, 2),           # Phase call at 600s
+        (base + timedelta(seconds=780), 1001, 1, 2),            # Green at 780s
+        (base + timedelta(seconds=790), 1001, 7, 2),            # Green end
+        (base + timedelta(seconds=790.2), 1001, 44, 2),         # Call drop
+
+        # Phase 3: 220s wait WITH a TSP adjustment. Past even the relaxed
+        # threshold, so raising the bar must not hide a genuine skip.
+        (base + timedelta(seconds=1200), 1001, 43, 3),          # Phase call at 1200s
+        (base + timedelta(seconds=1250), 1001, 114, 3),         # TSP extend green at 1250s
+        (base + timedelta(seconds=1280), 1001, 115, 3),         # TSP checkout at 1280s
+        (base + timedelta(seconds=1420), 1001, 1, 3),           # Green at 1420s
+        (base + timedelta(seconds=1430), 1001, 7, 3),           # Green end
+        (base + timedelta(seconds=1430.2), 1001, 44, 3),        # Call drop
+    ]
+
+    raw_df = pd.DataFrame(raw_events, columns=['TimeStamp', 'DeviceId', 'EventId', 'Parameter'])
+    raw_df['DeviceId'] = raw_df['DeviceId'].astype('int64')
+    raw_df['EventId'] = raw_df['EventId'].astype('int16')
+    raw_df['Parameter'] = raw_df['Parameter'].astype('int16')
+
+    params = {
+        'raw_data': raw_df,
+        'bin_size': 15,
+        'verbose': 0,
+        'aggregations': [
+            {'name': 'has_data', 'params': {'no_data_min': 15, 'min_data_points': 1}},
+            {'name': 'timeline', 'params': {'min_duration': 0.0, 'cushion_time': 60, 'maxtime': True}},
+            {'name': 'phase_wait', 'params': {'preempt_recovery_seconds': 120,
+                                              'assumed_cycle_length': 100,
+                                              'skip_multiplier': 1.5,
+                                              'tsp_skip_multiplier': 2.0}},
+            {'name': 'coordination_agg', 'params': {}}
+        ]
+    }
+
+    processor = SignalDataProcessor(**params)
+    processor.load()
+    processor.aggregate()
+
+    tsp_rows = processor.conn.query(
+        "SELECT * FROM timeline WHERE EventClass = 'TSP Adjustment' ORDER BY StartTime"
+    ).df()
+    phase_wait_agg = processor.conn.query(
+        "SELECT Phase, SUM(TotalSkips) AS TotalSkips, SUM(1) AS Bins "
+        "FROM phase_wait GROUP BY Phase ORDER BY Phase"
+    ).df()
+    processor.close()
+
+    # Guard the plumbing: if TSP adjustments stop reaching the timeline the skip
+    # assertions below would pass for the wrong reason.
+    assert len(tsp_rows) == 2, (
+        f"Expected 2 TSP Adjustment rows in timeline, got {len(tsp_rows)}:\n{tsp_rows.to_string()}"
+    )
+
+    skips = dict(zip(phase_wait_agg['Phase'], phase_wait_agg['TotalSkips']))
+
+    # All three waits are kept - TSP relaxes the threshold, it does not exclude.
+    assert set(skips) == {1, 2, 3}, (
+        f"Expected all three phases in phase_wait, got {sorted(skips)}.\n"
+        f"{phase_wait_agg.to_string()}"
+    )
+
+    assert skips[1] == 0, (
+        f"Phase 1 (180s wait, TSP adjustment inside, 200s TSP threshold) should not "
+        f"count as a skip, got {skips[1]}"
+    )
+    assert skips[2] == 1, (
+        f"Phase 2 (180s wait, no TSP, 150s threshold) should still count as a skip, "
+        f"got {skips[2]}"
+    )
+    assert skips[3] == 1, (
+        f"Phase 3 (220s wait, TSP adjustment inside, 200s TSP threshold) should still "
+        f"count as a skip, got {skips[3]}"
+    )
+
+
+def test_phase_wait_tsp_multiplier_defaults_to_two():
+    """tsp_skip_multiplier is optional and defaults to 2.0."""
+    from datetime import datetime, timedelta
+
+    base = datetime(2024, 6, 1, 8, 0, 0)
+    raw_events = [
+        (base, 1001, 43, 1),
+        (base + timedelta(seconds=60), 1001, 113, 1),
+        (base + timedelta(seconds=90), 1001, 115, 1),
+        (base + timedelta(seconds=180), 1001, 1, 1),
+        (base + timedelta(seconds=190), 1001, 7, 1),
+        (base + timedelta(seconds=190.2), 1001, 44, 1),
+    ]
+    raw_df = pd.DataFrame(raw_events, columns=['TimeStamp', 'DeviceId', 'EventId', 'Parameter'])
+    raw_df['DeviceId'] = raw_df['DeviceId'].astype('int64')
+    raw_df['EventId'] = raw_df['EventId'].astype('int16')
+    raw_df['Parameter'] = raw_df['Parameter'].astype('int16')
+
+    processor = SignalDataProcessor(
+        raw_data=raw_df,
+        bin_size=15,
+        verbose=0,
+        aggregations=[
+            {'name': 'has_data', 'params': {'no_data_min': 15, 'min_data_points': 1}},
+            {'name': 'timeline', 'params': {'min_duration': 0.0, 'cushion_time': 60, 'maxtime': True}},
+            # tsp_skip_multiplier deliberately omitted
+            {'name': 'phase_wait', 'params': {'preempt_recovery_seconds': 120,
+                                              'assumed_cycle_length': 100,
+                                              'skip_multiplier': 1.5}},
+            {'name': 'coordination_agg', 'params': {}}
+        ]
+    )
+    processor.load()
+    processor.aggregate()
+    total_skips = processor.conn.query("SELECT SUM(TotalSkips) FROM phase_wait").fetchone()[0]
+    processor.close()
+
+    # 180s wait against the default 2.0 x 100s TSP threshold: not a skip.
+    assert total_skips == 0, f"Expected the 2.0 default to clear the 180s wait, got {total_skips}"
+
+
 def test_phase_wait_invalid_event_propagation():
     """
     Test that Phase Wait events spanning over invalid events are marked invalid.

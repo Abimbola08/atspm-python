@@ -4,8 +4,10 @@
 -- This measure filters phase wait events from the timeline and:
 -- 1. Excludes phase waits occurring during or within N minutes after a preempt
 -- 2. Identifies skipped phases (wait time > 1.5× cycle length)
--- 3. Handles free mode (cycle length = 0) using assumed cycle length
--- 4. Uses MAX of cycle lengths at start and end of phase wait to avoid 
+-- 3. Relaxes that threshold for waits that saw a TSP adjustment, which delays
+--    service without skipping it
+-- 4. Handles free mode (cycle length = 0) using assumed cycle length
+-- 5. Uses MAX of cycle lengths at start and end of phase wait to avoid
 --    false skip detection when cycle length changes mid-wait
 --
 -- Requires: timeline (must be run before this aggregation)
@@ -15,6 +17,8 @@
 --   preempt_recovery_seconds: Time after preempt ends to exclude phase waits
 --   assumed_cycle_length: Fallback cycle length when in free mode (cycle = 0)
 --   skip_multiplier: Threshold multiplier for skipped phase detection
+--   tsp_skip_multiplier: Threshold multiplier used in place of skip_multiplier when
+--                        a TSP adjustment occurred during the wait
 --   controller_type: Controller type string (case-insensitive). When 'maxtime', 
 --                    uses ActualCycleLength (EventId 316) instead of CycleLength (EventId 132)
 
@@ -66,6 +70,19 @@ preempt_intervals AS (
     WHERE EventClass = 'Preempt' AND IsValid
 ),
 
+-- Get TSP adjustment events. Unlike a preempt these are not excluded: TSP delays
+-- service rather than skipping it, so a wait that saw one is judged against a
+-- higher multiplier instead of being dropped. Only the event time is needed - the
+-- timeline's EndTime for these runs to the next adjustment on the same phase, which
+-- says nothing about how long the adjustment itself lasted.
+tsp_adjustments AS (
+    SELECT
+        DeviceId,
+        StartTime AS AdjustTime
+    FROM timeline
+    WHERE EventClass = 'TSP Adjustment' AND IsValid
+),
+
 -- Get all phase wait events from timeline
 phase_waits_raw AS (
     SELECT
@@ -103,7 +120,13 @@ phase_waits_with_cycle AS (
         -- Get cycle length active at the START of the phase wait
         COALESCE(NULLIF(cl_start.CycleLength, 0), {{assumed_cycle_length}}) AS StartCycleLength,
         -- Get cycle length active at the END of the phase wait
-        COALESCE(NULLIF(cl_end.CycleLength, 0), {{assumed_cycle_length}}) AS EndCycleLength
+        COALESCE(NULLIF(cl_end.CycleLength, 0), {{assumed_cycle_length}}) AS EndCycleLength,
+        -- TRUE when a TSP adjustment landed inside the wait. The ASOF join returns
+        -- the latest adjustment at or before EndTime, so comparing that one against
+        -- StartTime is enough to know whether any fell in the window - and it stays
+        -- linear, where joining on the whole window would be quadratic. At a signal
+        -- calling TSP every cycle that product is millions of rows per device.
+        COALESCE(tsp.AdjustTime >= pw.StartTime, FALSE) AS TspFlag
     FROM phase_waits_flagged pw
     -- ASOF join: find the most recent cycle length change before or at StartTime
     ASOF LEFT JOIN cycle_lengths cl_start 
@@ -111,8 +134,12 @@ phase_waits_with_cycle AS (
         AND pw.StartTime >= cl_start.ChangeTime
     -- ASOF join: find the most recent cycle length change before or at EndTime
     ASOF LEFT JOIN cycle_lengths cl_end
-        ON pw.DeviceId = cl_end.DeviceId 
+        ON pw.DeviceId = cl_end.DeviceId
         AND pw.EndTime >= cl_end.ChangeTime
+    -- ASOF join: find the most recent TSP adjustment before or at EndTime
+    ASOF LEFT JOIN tsp_adjustments tsp
+        ON pw.DeviceId = tsp.DeviceId
+        AND pw.EndTime >= tsp.AdjustTime
     WHERE NOT pw.PreemptFlag
 ),
 
@@ -125,7 +152,11 @@ phase_waits_classified AS (
         -- This ensures we don't flag a phase as skipped just because
         -- the cycle length dropped after the phase started waiting
         GREATEST(StartCycleLength, EndCycleLength) AS EffectiveCycleLength,
-        CASE WHEN Duration > (GREATEST(StartCycleLength, EndCycleLength) * {{skip_multiplier}}) 
+        -- A wait that saw a TSP adjustment is held to the looser threshold. TSP
+        -- pushes service later in the cycle, so where calls are frequent the
+        -- ordinary multiplier reports skips for phases that were in fact served.
+        CASE WHEN Duration > (GREATEST(StartCycleLength, EndCycleLength) *
+                 CASE WHEN TspFlag THEN {{tsp_skip_multiplier}} ELSE {{skip_multiplier}} END)
              THEN 1 ELSE 0 END AS IsSkipped
     FROM phase_waits_with_cycle
 )

@@ -463,6 +463,11 @@ class SignalDataProcessor:
                         params['assumed_cycle_length'] = 140
                     if 'skip_multiplier' not in params:
                         params['skip_multiplier'] = 1.5
+                    # TSP delays service without skipping it, so waits that saw an
+                    # adjustment are judged against a looser threshold rather than
+                    # excluded the way preempts are.
+                    if 'tsp_skip_multiplier' not in params:
+                        params['tsp_skip_multiplier'] = 2.0
 
                 #######################
                 ### Timeline ###

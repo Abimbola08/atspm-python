@@ -156,7 +156,8 @@ params = {
             'params': {
                 'preempt_recovery_seconds': 120, # Time after preempt ends to exclude
                 'assumed_cycle_length': 140,     # Fallback cycle length (Free mode)
-                'skip_multiplier': 1.5           # Threshold for skipped phases
+                'skip_multiplier': 1.5,          # Threshold for skipped phases
+                'tsp_skip_multiplier': 2.0       # Same, for waits that saw a TSP adjustment
             }
         },
         {'name': 'ped_delay', 'params': {}},
